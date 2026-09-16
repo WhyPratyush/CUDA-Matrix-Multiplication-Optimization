@@ -74,7 +74,7 @@ This project measures the differnet optimization techniques for CUDA Matrix Mult
         }
 
     Expected: ~3x improvement compared to naive
-    Actual: 1.27x, Although the global memory coalescing improved, it didnt do much for the shared memory and we still have one output per thread.
+    Actual: 1.27x, Although the global memory coalescing improved, it didnt do much for the shared memory and we still have one output per thread. The real reason that coalescing didn't work was the memory was already coalesced, the real bottleneck as seen from the ncu's scheduler, is the MIO throttle stalls, the threads filled up the shared memory queue so many had to wait for their turn causing the bottleneck.
 
 - 1D Blocktiling: A single thread now computes multiple results instead of 1.
 
@@ -121,6 +121,26 @@ This project measures the differnet optimization techniques for CUDA Matrix Mult
     Expected: Significant improvement compared to 1D blocktiling
     Actual: 4.05x Naive
 
+- Vectorized: Instead of loading global memory one float at a time, each thread loads 4 consecutive floats in a single 128-bit transaction using float4. This cuts the number of shared-memory load/store instructions by 4x, directly reducing pressure on the MIO instruction pipeline.
+
+    Key Code Snippet:
+
+        float4 tmpA = reinterpret_cast<float4*>(&A[innerRowA * N + innerColA * 4])[0];
+        As[(innerColA * 4 + 0) * (TILE + PAD) + innerRowA] = tmpA.x;
+        As[(innerColA * 4 + 1) * (TILE + PAD) + innerRowA] = tmpA.y;
+        As[(innerColA * 4 + 2) * (TILE + PAD) + innerRowA] = tmpA.z;
+        As[(innerColA * 4 + 3) * (TILE + PAD) + innerRowA] = tmpA.w;
+
+        reinterpret_cast<float4*>(&Bs[innerRowB * TILE + innerColB * 4])[0] =
+            reinterpret_cast<float4*>(&B[innerRowB * N + innerColB * 4])[0];
+
+        float4 tmpC = { threadResults[i*TN+j], threadResults[i*TN+j+1],
+                        threadResults[i*TN+j+2], threadResults[i*TN+j+3] };
+        reinterpret_cast<float4*>(&C[(threadRow*TM+i)*N + threadCol*TN+j])[0] = tmpC;
+
+Expected: Meaningful improvement over 2D Blocktiling by relieving MIO pipe pressure, since profiling identified this as the dominant stall reason (not bank conflicts or bandwidth).
+Actual: 4.95x Naive (61.3% of cuBLAS), up from 4.29x (53.1%) for 2D Blocktiling. Store-side bank conflicts introduced by the A transpose were confirmed via ncu (l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum) and fully eliminated with PAD=4; load-side conflicts (...op_ld.sum) remain unresolved
+
 Compilation commands:
 
 - Naive :   
@@ -148,20 +168,25 @@ Compilation commands:
             nvcc -O3 -arch=sm_75 2DBlocktiling.cu -o 2DBlocktiling 
             ./2DBlocktiling 
 
+- Vectorized :
+            nvcc -O3 -arch=sm_75 vectorized.cu -o vectorized
+            ./vectorized
+
 ### PERFORMANCE ANALYSIS:
 
-| Implementation             | Time (ms) | GFLOPS  | % of cuBLAS | Speedup vs Naive |
-|----------------------------|-----------|---------|-------------|------------------|
-| Naive                      | 6.789696  | 316.276 |   12.213%   | 1.0x             |
-| Tiled                      | 5.250886  | 408.975 |   15.791%   | 1.293x           |
-| Tiled + Coalesced          | 5.30512   | 404.794 |   15.63%    | 1.279x           |
-| 1D Blocktiling             | 2.442988  | 879.039 |   33.942%   | 2.779x           |
-| 2D Blocktiling             | 1.672896  | 1283.69 |   49.566%   | 4.058x           |
-| cuBLAS                     | 0.8291968 | 2589.84 |     100%    | 8.188x           |
+| Implementation               | Time (ms) | GFLOPS  | % of cuBLAS  | Speedup vs Naive  |
+|------------------------------|-----------|---------|--------------|-------------------|
+| Naive                        |     4.268 |  503.16 |        12.4% | 1.00x             |
+| Tiled                        |     3.277 |  655.36 |        16.1% | 1.30x             |
+| Tiled + Coalesced            |     3.313 |  648.18 |        15.9% | 1.29x             |
+| 1D Blocktiling               |     1.497 | 1434.50 |        35.3% | 2.85x             |
+| 2D Blocktiling               |     0.995 | 2157.84 |        53.1% | 4.29x             |
+| Vectorized (float4 + padded) |     0.862 | 2490.68 |        61.3% | 4.95x             |
+| cuBLAS                       |     0.528 | 4064.49 |       100.0% | 8.08x             |
 
 
 
-![PERFORMANCE PROGRESSION](Performance_Analysis.png)
+![PERFORMANCE PROGRESSION](PerformanceAnalysis.png)
 
 ### Diminishing Returns
 

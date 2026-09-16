@@ -1,9 +1,9 @@
 %%writefile benchmark.cu
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h> 
+#include <math.h> // For fabs
 #include <cuda_runtime.h>
-#include <cublas_v2.h> 
+#include <cublas_v2.h> // For cublas
 
 const int N = 1024;
 const int TILE = 32;
@@ -21,7 +21,7 @@ void verify(float *h_C, float expected_value, int n, const char* kernel_name) {
     bool success = true;
     for (int i = 0; i < n * n; ++i) {
         if (fabs(h_C[i] - expected_value) > 1e-5) {
-            printf("[%s] Verification FAILED at index %d! Expected: %f, Got: %f\n", 
+            printf("[%s] Verification FAILED at index %d! Expected: %f, Got: %f\n",
                    kernel_name, i, expected_value, h_C[i]);
             success = false;
             break;
@@ -243,6 +243,75 @@ __global__ void matMul2D(float *A, float *B, float *C,int N) {
   }
 }
 
+// --- Vectorized 2D Blocktiling (float4 global loads + padded As to avoid bank conflicts) ---
+#define VEC_PAD 4
+
+__global__ void matMulVectorized(float *A, float *B, float *C, int N) {
+  const int cRow = blockIdx.y;
+  const int cCol = blockIdx.x;
+
+  const int threadCol = threadIdx.x % (TILE_2D / TN);
+  const int threadRow = threadIdx.x / (TILE_2D / TN);
+
+  __shared__ float As[BK * (TILE_2D + VEC_PAD)];
+  __shared__ float Bs[BK * TILE_2D];
+
+  A += cRow * TILE_2D * N;
+  B += cCol * TILE_2D;
+  C += cRow * TILE_2D * N + cCol * TILE_2D;
+
+  const int innerRowA = threadIdx.x / (BK / 4);
+  const int innerColA = threadIdx.x % (BK / 4);
+  const int innerRowB = threadIdx.x / (TILE_2D / 4);
+  const int innerColB = threadIdx.x % (TILE_2D / 4);
+
+  float threadResults[TM * TN] = {0.0f};
+  float regM[TM] = {0.0f};
+  float regN[TN] = {0.0f};
+
+  for (int t = 0; t < N; t += BK) {
+    float4 tmpA = reinterpret_cast<float4 *>(&A[innerRowA * N + innerColA * 4])[0];
+    As[(innerColA * 4 + 0) * (TILE_2D + VEC_PAD) + innerRowA] = tmpA.x;
+    As[(innerColA * 4 + 1) * (TILE_2D + VEC_PAD) + innerRowA] = tmpA.y;
+    As[(innerColA * 4 + 2) * (TILE_2D + VEC_PAD) + innerRowA] = tmpA.z;
+    As[(innerColA * 4 + 3) * (TILE_2D + VEC_PAD) + innerRowA] = tmpA.w;
+
+    reinterpret_cast<float4 *>(&Bs[innerRowB * TILE_2D + innerColB * 4])[0] =
+        reinterpret_cast<float4 *>(&B[innerRowB * N + innerColB * 4])[0];
+
+    __syncthreads();
+
+    A += BK;
+    B += BK * N;
+
+    for (int k = 0; k < BK; ++k) {
+      for (int i = 0; i < TM; ++i) {
+        regM[i] = As[k * (TILE_2D + VEC_PAD) + threadRow * TM + i];
+      }
+      for (int i = 0; i < TN; ++i) {
+        regN[i] = Bs[k * TILE_2D + threadCol * TN + i];
+      }
+      for (int i = 0; i < TM; ++i) {
+        for (int j = 0; j < TN; ++j) {
+          threadResults[i * TN + j] += regM[i] * regN[j];
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int i = 0; i < TM; ++i) {
+    for (int j = 0; j < TN; j += 4) {
+      float4 tmpC;
+      tmpC.x = threadResults[i * TN + j + 0];
+      tmpC.y = threadResults[i * TN + j + 1];
+      tmpC.z = threadResults[i * TN + j + 2];
+      tmpC.w = threadResults[i * TN + j + 3];
+      reinterpret_cast<float4 *>(
+          &C[(threadRow * TM + i) * N + threadCol * TN + j])[0] = tmpC;
+    }
+  }
+}
 
 
 int main() {
@@ -279,6 +348,7 @@ int main() {
     float tiled_2d_ms = 0.0f;
     float tiled_1d_ms = 0.0f;
     float reg_blocked_ms = 0.0f;
+    float vectorized_ms = 0.0f;
     float cublas_ms = 0.0f;
 
     printf("Running Matrix Multiplication Benchmarks (N=%d)\n", N);
@@ -331,7 +401,7 @@ int main() {
     cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
     verify(h_C, expected_value, N, "Tiled + Coalesced");
     printf("Time: %f ms\n", tiled_2d_ms);
-    
+
     printf("\n--- 4. 1D Blocktiling ---\n");
     cudaMemset(d_C, 0, size);
     dim3 threadsPerBlockTiled1D(TILE_1D * BK);
@@ -349,7 +419,7 @@ int main() {
 
     printf("\n--- 5. Tiled 2D + Register Blocking ---\n");
     cudaMemset(d_C, 0, size);
-    dim3 threadsPerBlockReg((TILE_2D * TILE_2D)/(TM*TN)); 
+    dim3 threadsPerBlockReg((TILE_2D * TILE_2D)/(TM*TN));
     dim3 numBlocksReg(N / TILE_2D, N / TILE_2D);
     matMul2D<<<numBlocksReg, threadsPerBlockReg>>>(d_A, d_B, d_C, N);
     cudaDeviceSynchronize();
@@ -361,8 +431,22 @@ int main() {
     cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
     verify(h_C, expected_value, N, "2D Blocktiling");
     printf("Time: %f ms\n", reg_blocked_ms);
-    
-    printf("\n--- 6. cuBLAS ---\n");
+
+    printf("\n--- 6. Vectorized (float4 loads + padded shared mem) ---\n");
+    cudaMemset(d_C, 0, size);
+    // Reuses the same grid/block dims as 2D Blocktiling (same TILE_2D/TM/TN)
+    matMulVectorized<<<numBlocksReg, threadsPerBlockReg>>>(d_A, d_B, d_C, N);
+    cudaDeviceSynchronize();
+    cudaEventRecord(start, 0);
+    matMulVectorized<<<numBlocksReg, threadsPerBlockReg>>>(d_A, d_B, d_C, N);
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&vectorized_ms, start, stop);
+    cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+    verify(h_C, expected_value, N, "Vectorized");
+    printf("Time: %f ms\n", vectorized_ms);
+
+    printf("\n--- 7. cuBLAS ---\n");
     cudaMemset(d_C, 0, size);
     cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, N, N, N, &alpha, d_B, N, d_A, N, &beta, d_C, N);
     cudaDeviceSynchronize();
@@ -376,34 +460,37 @@ int main() {
     printf("Time: %f ms\n", cublas_ms);
 
     printf("\n\n--- Performance Summary Table ---\n\n");
-    
+
     double ops = 2.0 * (double)N * (double)N * (double)N;
     double gflops_naive = (ops / (naive_ms / 1000.0)) / 1e9;
     double gflops_non_coalesced = (ops / (non_coalesced_ms / 1000.0)) / 1e9;
     double gflops_tiled_2d = (ops / (tiled_2d_ms / 1000.0)) / 1e9;
     double gflops_tiled_1d = (ops / (tiled_1d_ms / 1000.0)) / 1e9;
     double gflops_reg_blocked = (ops / (reg_blocked_ms / 1000.0)) / 1e9;
+    double gflops_vectorized = (ops / (vectorized_ms / 1000.0)) / 1e9;
     double gflops_cublas = (ops / (cublas_ms / 1000.0)) / 1e9;
 
     printf("| Implementation               | Time (ms) | GFLOPS  | %% of cuBLAS  | Speedup vs Naive  |\n");
     printf("|------------------------------|-----------|---------|--------------|-------------------|\n");
-    printf("| Naive                        | %9.3f | %7.2f | %11.1f%% | 1.00x            |\n", 
+    printf("| Naive                        | %9.3f | %7.2f | %11.1f%% | 1.00x            |\n",
            naive_ms, gflops_naive, (gflops_naive / gflops_cublas) * 100.0);
-    printf("| Tiled                        | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n", 
+    printf("| Tiled                        | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n",
            non_coalesced_ms, gflops_non_coalesced, (gflops_non_coalesced / gflops_cublas) * 100.0, gflops_non_coalesced / gflops_naive);
-    printf("| Tiled + Coalesced            | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n", 
+    printf("| Tiled + Coalesced            | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n",
            tiled_2d_ms, gflops_tiled_2d, (gflops_tiled_2d / gflops_cublas) * 100.0, gflops_tiled_2d / gflops_naive);
-    printf("| 1D Blocktiling               | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n", 
+    printf("| 1D Blocktiling               | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n",
            tiled_1d_ms, gflops_tiled_1d, (gflops_tiled_1d / gflops_cublas) * 100.0, gflops_tiled_1d / gflops_naive);
-    printf("| 2D Blocktiling               | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n", 
+    printf("| 2D Blocktiling               | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n",
            reg_blocked_ms, gflops_reg_blocked, (gflops_reg_blocked / gflops_cublas) * 100.0, gflops_reg_blocked / gflops_naive);
-    printf("| cuBLAS                       | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n", 
+    printf("| Vectorized (float4 + padded) | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n",
+           vectorized_ms, gflops_vectorized, (gflops_vectorized / gflops_cublas) * 100.0, gflops_vectorized / gflops_naive);
+    printf("| cuBLAS                       | %9.3f | %7.2f | %11.1f%% | %.2fx            |\n",
            cublas_ms, gflops_cublas, (gflops_cublas / gflops_cublas) * 100.0, gflops_cublas / gflops_naive);
 
     cublasDestroy(handle);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    
+
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
